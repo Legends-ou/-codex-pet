@@ -147,6 +147,14 @@ internal static class NativeMethods
     [DllImport("user32.dll", ExactSpelling = true)]
     internal static extern nint SetThreadDpiAwarenessContext(nint dpiContext);
 
+    // Raised only while a pet is actively being dragged. The matching end call
+    // is required so the process returns to normal idle power usage.
+    [DllImport("winmm.dll", ExactSpelling = true)]
+    internal static extern uint timeBeginPeriod(uint milliseconds);
+
+    [DllImport("winmm.dll", ExactSpelling = true)]
+    internal static extern uint timeEndPeriod(uint milliseconds);
+
     [StructLayout(LayoutKind.Sequential)]
     internal readonly struct Point(int x, int y)
     {

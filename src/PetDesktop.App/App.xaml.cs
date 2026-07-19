@@ -76,7 +76,7 @@ public partial class App : System.Windows.Application, IDisposable
             SetScalePercent);
         _tray.MenuVisibilityChanged += OnMenuVisibilityChanged;
         _speechBubble = new PetSpeechBubble();
-        _managementWindow = new MainWindow(_settings.Theme, (title, message) => _tray?.ShowStatus(title, message), ShowPetMessage, SetTheme, NativeMethods.GetInputIdleTime);
+        _managementWindow = new MainWindow(_settings.Theme, (title, message) => _tray?.ShowStatus(title, message), ShowPetMessage, SetTheme, SelectPet, NativeMethods.GetInputIdleTime);
         _ = InitializeApplicationAsync();
     }
 
@@ -122,6 +122,8 @@ public partial class App : System.Windows.Application, IDisposable
             {
                 _animation?.SetResourcePhase(ResourceAnimationPhase.None);
                 _tray?.ShowStatus("Pet Desktop", "No valid pet package was found in the pets folder.");
+                ShowManagementCenter();
+                _managementWindow?.ShowEmptyPetSetup(_resourceRoot);
                 return;
             }
 
@@ -151,6 +153,8 @@ public partial class App : System.Windows.Application, IDisposable
             }
 
             _asset = candidate;
+            _managementWindow?.SetPetCatalog(pets, pet.Id);
+            _managementWindow?.SetActivePet(pet);
             _lastRenderedFrame = null;
             _animation = new AnimationStateMachine(layout);
             var frame = candidate.ActionFrames[PetAction.Idle][0];
@@ -215,6 +219,7 @@ public partial class App : System.Windows.Application, IDisposable
 
     public void Dispose()
     {
+        _managementWindow?.FlushProgress();
         if (_animationTimer is not null)
         {
             _animationTimer.Stop();
@@ -317,8 +322,10 @@ public partial class App : System.Windows.Application, IDisposable
             position.Y,
             width,
             height,
-            FrameScaler.ScaleBgra(frame.CopyPixelBytes(), frame.Width, frame.Height, width, height),
-            revealWindow);
+            FrameScaler.ScaleBgra(frame.PixelBytes, frame.Width, frame.Height, width, height),
+            revealWindow,
+            width == frame.Width && height == frame.Height ? frame.HitTestMask : null,
+            preserveCurrentPosition: _isDragging);
         _displayWidth = width;
         _displayHeight = height;
         _lastRenderedFrame = frame;
@@ -362,7 +369,6 @@ public partial class App : System.Windows.Application, IDisposable
         if (result.StartDrag)
         {
             _isDragging = true;
-            _animationTimer?.Interval = TimeSpan.FromMilliseconds(10);
         }
 
         if ((result.StartDrag || result.MoveDrag) && result.HorizontalDelta != 0)
@@ -400,7 +406,7 @@ public partial class App : System.Windows.Application, IDisposable
                 ShowManagementCenter();
                 break;
             case PetCommand.NewNote:
-                _managementWindow?.CreateNote();
+                _managementWindow?.CreateNote(GetPetBounds());
                 break;
             case PetCommand.SizeSmall:
                 SetSize(PetSize.Small);
@@ -445,6 +451,10 @@ public partial class App : System.Windows.Application, IDisposable
     {
         _ = ReloadPetAsync(petId);
     }
+
+    private System.Drawing.Rectangle? GetPetBounds() => _lastKnownPosition is { } position && _displayWidth > 0 && _displayHeight > 0
+        ? new System.Drawing.Rectangle(position.X, position.Y, _displayWidth, _displayHeight)
+        : null;
 
     private void OnMenuVisibilityChanged(bool visible)
     {
@@ -537,7 +547,7 @@ public partial class App : System.Windows.Application, IDisposable
 
     private void ShowManagementCenter()
     {
-        _managementWindow ??= new MainWindow(_settings.Theme, (title, message) => _tray?.ShowStatus(title, message), ShowPetMessage, SetTheme, NativeMethods.GetInputIdleTime);
+        _managementWindow ??= new MainWindow(_settings.Theme, (title, message) => _tray?.ShowStatus(title, message), ShowPetMessage, SetTheme, SelectPet, NativeMethods.GetInputIdleTime);
         _managementWindow.Show();
         _managementWindow.Activate();
     }

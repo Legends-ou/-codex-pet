@@ -3,6 +3,8 @@ using System.Windows.Controls;
 using System.Globalization;
 using System.Windows.Media;
 using System.Windows.Threading;
+using System.Windows.Interop;
+using PetDesktop.App.Windows;
 using PetDesktop.Core.Configuration;
 using MediaColor = System.Windows.Media.Color;
 using MediaColorConverter = System.Windows.Media.ColorConverter;
@@ -13,6 +15,8 @@ using ComboBox = System.Windows.Controls.ComboBox;
 using Orientation = System.Windows.Controls.Orientation;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
 using VerticalAlignment = System.Windows.VerticalAlignment;
+using DrawingRectangle = System.Drawing.Rectangle;
+using FormsScreen = System.Windows.Forms.Screen;
 
 namespace PetDesktop.App;
 
@@ -22,10 +26,13 @@ public sealed partial class NoteEditorDialog : Window
     private SolidColorBrush _calendarMuted = Brush("#A1A1A6");
     private readonly HashSet<DayOfWeek> _weeklyDays = [];
     private readonly ComboBox MonthlyDayInput = new() { Width = 92 };
+    private readonly DrawingRectangle? _petBounds;
 
-    public NoteEditorDialog(AppTheme theme, string? text = null, DateTime? dueAt = null, string repeat = "single")
+    public NoteEditorDialog(AppTheme theme, string? text = null, DateTime? dueAt = null, string repeat = "single", DrawingRectangle? petBounds = null)
     {
         InitializeComponent();
+        _petBounds = petBounds;
+        Loaded += (_, _) => PositionNearPet();
         RepeatInput.Style = (Style)Resources["RepeatCombo"];
         MonthlyDayInput.Style = (Style)Resources["RepeatCombo"];
         MonthlyDayInput.ItemsSource = Enumerable.Range(1, 31).Select(day => day.ToString("D2", CultureInfo.InvariantCulture)).ToArray();
@@ -278,6 +285,33 @@ public sealed partial class NoteEditorDialog : Window
     }
 
     private void CancelClick(object sender, RoutedEventArgs e) => DialogResult = false;
+
+    private void PositionNearPet()
+    {
+        if (_petBounds is not { } petBounds) return;
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == nint.Zero || !NativeMethods.GetWindowRect(handle, out var dialog)) return;
+
+        var width = Math.Max(1, dialog.Right - dialog.Left);
+        var height = Math.Max(1, dialog.Bottom - dialog.Top);
+        var workArea = FormsScreen.FromRectangle(petBounds).WorkingArea;
+        var x = petBounds.Right + 14;
+        if (x + width > workArea.Right)
+        {
+            x = petBounds.Left - width - 14;
+        }
+
+        x = Math.Clamp(x, workArea.Left, Math.Max(workArea.Left, workArea.Right - width));
+        var y = Math.Clamp(petBounds.Top, workArea.Top, Math.Max(workArea.Top, workArea.Bottom - height));
+        _ = NativeMethods.SetWindowPos(
+            handle,
+            nint.Zero,
+            x,
+            y,
+            0,
+            0,
+            NativeMethods.SwpNoSize | NativeMethods.SwpNoZOrder);
+    }
 
     private void OpenDatePicker(object sender, RoutedEventArgs e)
     {

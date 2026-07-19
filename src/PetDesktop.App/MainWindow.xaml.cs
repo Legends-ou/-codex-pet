@@ -5,6 +5,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Threading;
+using PetDesktop.Core.Companion;
 using PetDesktop.Core.Configuration;
 using PetDesktop.Core.Pets;
 using PetDesktop.Core.Progress;
@@ -44,11 +45,17 @@ public partial class MainWindow : Window
     private Guid? _selectedNoteId;
     private readonly string _progressPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PetDesktop", "progress.json");
     private ProgressState _progress = new(0);
+    private string _activePetId = PetPhraseLibraries.DefaultPetId;
+    private string _activePetName = "默认宠物";
     private readonly Action<string, string> _notify;
     private readonly Action<string, PetAction> _showPetMessage;
     private readonly Action<AppTheme> _setTheme;
+    private readonly Action<string> _selectPet;
     private readonly Func<TimeSpan> _inputIdleTime;
+    private IReadOnlyList<PetDescriptor> _pets = [];
+    private bool _updatingPetSelector;
     private readonly DispatcherTimer _reminderTimer;
+    private DispatcherTimer? _progressSaveTimer;
     private WpfCheckBox WellnessEnabledInput = null!;
     private WpfTextBox WellnessInitialMinutesInput = null!;
     private WpfTextBox WellnessRepeatMinutesInput = null!;
@@ -57,7 +64,7 @@ public partial class MainWindow : Window
     private WpfListBox WellnessPromptsList = null!;
     private Grid CompanionActivityGrid = null!;
 
-    public MainWindow(AppTheme theme, Action<string, string> notify, Action<string, PetAction> showPetMessage, Action<AppTheme> setTheme, Func<TimeSpan> inputIdleTime)
+    public MainWindow(AppTheme theme, Action<string, string> notify, Action<string, PetAction> showPetMessage, Action<AppTheme> setTheme, Action<string> selectPet, Func<TimeSpan> inputIdleTime)
     {
         InitializeComponent();
         CreateActivityGrid();
@@ -65,6 +72,7 @@ public partial class MainWindow : Window
         _notify = notify;
         _showPetMessage = showPetMessage;
         _setTheme = setTheme;
+        _selectPet = selectPet;
         _inputIdleTime = inputIdleTime;
         ApplyTheme(theme);
         LoadNotes();
@@ -74,6 +82,8 @@ public partial class MainWindow : Window
         RefreshProgress();
         RefreshContentLists();
         _reminderTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
+        _progressSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
+        _progressSaveTimer.Tick += (_, _) => SaveProgress();
         _progress = _progress with { LastUsageTrackedAt = DateTimeOffset.UtcNow };
         SaveProgress();
         _reminderTimer.Tick += (_, _) => { TrackUsageTime(); CheckReminders(); CheckQuoteSchedule(); CheckWellness(); };
@@ -96,8 +106,85 @@ public partial class MainWindow : Window
         Resources["OnPrimary"] = Brush("#FFFFFF");
         Resources["Selected"] = Brush(light ? "#E3F0FF" : "#223C5B");
         Resources["Danger"] = Brush(light ? "#E33A31" : "#FF6B63");
+        Resources["ActivityZero"] = Brush(light ? "#E7EBF0" : "#36373D");
+        Resources["ActivityLow"] = Brush(light ? "#CFE7FF" : "#1D3A53");
+        Resources["ActivityMedium"] = Brush(light ? "#8CC0FA" : "#2A638F");
+        Resources["ActivityHigh"] = Brush(light ? "#3B82F6" : "#3C89D2");
+        Resources["ActivityPeak"] = Brush(light ? "#1463B8" : "#86BEFF");
         ThemeToggle.Content = light ? "深色外观" : "浅色外观";
         ApplyWellnessInputTheme();
+        SetNavState(HomeNav, _currentPage == "home");
+        SetNavState(NotesNav, _currentPage == "notes");
+        SetNavState(CompanionNav, _currentPage == "companion");
+        SetNavState(SettingsNav, _currentPage == "settings");
+        RefreshActivityGrid();
+    }
+
+    public void SetActivePet(PetDescriptor pet)
+    {
+        var petId = PetPhraseLibraries.NormalizePetId(pet.Id);
+        _activePetId = petId;
+        _activePetName = string.IsNullOrWhiteSpace(pet.DisplayName) ? petId : pet.DisplayName;
+        var profiles = PetPhraseLibraries.EnsureProfile(
+            _progress.PetPhraseLibraries,
+            petId,
+            new PetPhraseLibrary(_progress.CustomQuotes, _progress.WellnessBuiltInPrompts, _progress.WellnessCustomPrompts));
+        if (!DictionaryEqual(_progress.PetPhraseLibraries, profiles))
+        {
+            _progress = _progress with { PetPhraseLibraries = profiles };
+            SaveProgress();
+        }
+
+        PhraseLibraryPetLabel.Text = $"当前宠物：{_activePetName}";
+        RefreshPetSelectors();
+        RefreshContentLists();
+    }
+
+    public void SetPetCatalog(IReadOnlyList<PetDescriptor> pets, string activePetId)
+    {
+        _pets = pets;
+        _activePetId = PetPhraseLibraries.NormalizePetId(activePetId);
+        RefreshPetSelectors();
+        var hasPets = pets.Count > 0;
+        PetSelector.IsEnabled = hasPets;
+        PhrasePetSelector.IsEnabled = hasPets;
+    }
+
+    public void ShowEmptyPetSetup(string petsDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(petsDirectory);
+        Navigate("home");
+        PageTitle.Text = "添加你的第一个桌宠";
+        PageSubtitle.Text = "此版本不内置宠物资源，所有宠物均由你自行配置。";
+        ContentTitle.Text = "还没有可用的桌宠";
+        ContentDetail.Text = $"请在托盘菜单中选择“打开宠物目录”，然后把兼容 Codex v1 或 v2 格式的宠物文件夹放入：{Environment.NewLine}{petsDirectory}";
+        NoteActions.Visibility = Visibility.Collapsed;
+        PetSelector.IsEnabled = false;
+        PhrasePetSelector.IsEnabled = false;
+    }
+
+    private void RefreshPetSelectors()
+    {
+        var entries = _pets.Select(pet => new PetSelection(pet.Id, pet.DisplayName)).ToArray();
+        var selected = entries.FirstOrDefault(entry => string.Equals(entry.Id, _activePetId, StringComparison.Ordinal));
+        _updatingPetSelector = true;
+        try
+        {
+            PetSelector.ItemsSource = entries;
+            PhrasePetSelector.ItemsSource = entries;
+            PetSelector.SelectedItem = selected;
+            PhrasePetSelector.SelectedItem = selected;
+        }
+        finally
+        {
+            _updatingPetSelector = false;
+        }
+    }
+
+    private void PetSelectorChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_updatingPetSelector || (sender as System.Windows.Controls.ComboBox)?.SelectedItem is not PetSelection selection) return;
+        _selectPet(selection.Id);
     }
 
     private static SolidColorBrush Brush(string color) => new((MediaColor)MediaColorConverter.ConvertFromString(color));
@@ -169,7 +256,8 @@ public partial class MainWindow : Window
         delete.SetResourceReference(Control.ForegroundProperty, "Danger");
         delete.Click += DeleteSelectedWellnessPromptClick;
         content.Children.Add(delete);
-        WellnessPromptsList = new WpfListBox { Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(0, 8, 0, 0), MaxHeight = 96 };
+        WellnessPromptsList = new WpfListBox { Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(0, 8, 0, 0), MaxHeight = 174 };
+        ScrollViewer.SetVerticalScrollBarVisibility(WellnessPromptsList, ScrollBarVisibility.Auto);
         WellnessPromptsList.SelectionChanged += WellnessPromptSelectionChanged;
         content.Children.Add(WellnessPromptsList);
 
@@ -271,8 +359,8 @@ public partial class MainWindow : Window
 
     private void SetNavState(System.Windows.Controls.Button button, bool active)
     {
-        button.Background = active ? (System.Windows.Media.Brush)Resources["Selected"] : System.Windows.Media.Brushes.Transparent;
-        button.Foreground = active ? (System.Windows.Media.Brush)Resources["Primary"] : (System.Windows.Media.Brush)Resources["TextSecondary"];
+        button.Background = active ? (Brush)Resources["Selected"] : Brushes.Transparent;
+        button.Foreground = active ? (Brush)Resources["Primary"] : (Brush)Resources["TextSecondary"];
     }
 
     private void PrimaryActionClick(object sender, RoutedEventArgs e)
@@ -339,11 +427,11 @@ public partial class MainWindow : Window
         if (WellnessPromptsList.SelectedIndex is var index && index >= 0 && index < builtIns.Length)
         {
             builtIns[index] = prompt;
-            _progress = _progress with { WellnessBuiltInPrompts = builtIns };
+            UpdateCurrentPhraseLibrary(library => library with { WellnessBuiltInPrompts = builtIns });
         }
         else
         {
-            _progress = _progress with { WellnessCustomPrompts = [.. (_progress.WellnessCustomPrompts ?? []), prompt] };
+            UpdateCurrentPhraseLibrary(library => library with { WellnessCustomPrompts = [.. (library.WellnessCustomPrompts ?? []), prompt] });
         }
         WellnessPromptInput.Clear();
         SaveProgress();
@@ -352,8 +440,8 @@ public partial class MainWindow : Window
 
     private void DeleteSelectedWellnessPromptClick(object sender, RoutedEventArgs e)
     {
-        if (WellnessPromptsList.SelectedIndex < WellnessBuiltIns().Length || WellnessPromptsList.SelectedItem is not string prompt || !(_progress.WellnessCustomPrompts ?? []).Contains(prompt)) return;
-        _progress = _progress with { WellnessCustomPrompts = (_progress.WellnessCustomPrompts ?? []).Where(item => item != prompt).ToArray() };
+        if (WellnessPromptsList.SelectedIndex < WellnessBuiltIns().Length || WellnessPromptsList.SelectedItem is not string prompt || !(CurrentPhraseLibrary.WellnessCustomPrompts ?? []).Contains(prompt)) return;
+        UpdateCurrentPhraseLibrary(library => library with { WellnessCustomPrompts = (library.WellnessCustomPrompts ?? []).Where(item => item != prompt).ToArray() });
         SaveProgress();
         RefreshContentLists();
     }
@@ -366,15 +454,25 @@ public partial class MainWindow : Window
     {
         var quote = CustomQuoteInput.Text.Trim();
         if (string.IsNullOrWhiteSpace(quote)) return;
-        _progress = _progress with { CustomQuotes = [.. (_progress.CustomQuotes ?? []), quote] };
+        UpdateCurrentPhraseLibrary(library => library with { CustomQuotes = [.. (library.CustomQuotes ?? []), quote] });
         SaveProgress(); CustomQuoteInput.Clear(); ContentDetail.Text = "已添加自定义短句。";
         RefreshContentLists();
     }
 
     private void DeleteSelectedQuoteClick(object sender, RoutedEventArgs e)
     {
-        if (QuotesList.SelectedItem is not string quote || !(_progress.CustomQuotes ?? []).Contains(quote)) return;
-        _progress = _progress with { CustomQuotes = (_progress.CustomQuotes ?? []).Where(item => item != quote).ToArray() };
+        if (QuotesList.SelectedItem is not QuoteListEntry entry) return;
+        if (entry.IsPreset)
+        {
+            var index = QuotesList.SelectedIndex;
+            var presets = QuoteBuiltIns();
+            if (index < 0 || index >= presets.Length) return;
+            UpdateCurrentPhraseLibrary(library => library with { BuiltInQuotes = presets.Where((_, itemIndex) => itemIndex != index).ToArray() });
+        }
+        else
+        {
+            UpdateCurrentPhraseLibrary(library => library with { CustomQuotes = (library.CustomQuotes ?? []).Where(item => item != entry.Text).ToArray() });
+        }
         SaveProgress();
         RefreshContentLists();
     }
@@ -382,7 +480,15 @@ public partial class MainWindow : Window
     private void ClearCustomQuotesClick(object sender, RoutedEventArgs e)
     {
         if (System.Windows.MessageBox.Show("清空所有自定义短句？内置短句不会受影响。", "确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
-        _progress = _progress with { CustomQuotes = [] };
+        UpdateCurrentPhraseLibrary(library => library with { CustomQuotes = [] });
+        SaveProgress();
+        RefreshContentLists();
+    }
+
+    private void RestorePresetQuotesClick(object sender, RoutedEventArgs e)
+    {
+        if (System.Windows.MessageBox.Show("恢复当前宠物的预设短句，并清空自定义短句？", "确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+        UpdateCurrentPhraseLibrary(library => library with { BuiltInQuotes = null, CustomQuotes = [] });
         SaveProgress();
         RefreshContentLists();
     }
@@ -424,9 +530,9 @@ public partial class MainWindow : Window
         RefreshContentLists();
     }
 
-    public void CreateNote()
+    public void CreateNote(System.Drawing.Rectangle? petBounds = null)
     {
-        var editor = new NoteEditorDialog(_theme);
+        var editor = new NoteEditorDialog(_theme, petBounds: petBounds);
         if (IsVisible) editor.Owner = this;
         if (editor.ShowDialog() != true || editor.Draft is not { } draft) return;
         _notes.Add(new NoteItem(Guid.NewGuid(), draft.Text, false, DateTimeOffset.UtcNow, draft.DueAt, false, draft.Repeat));
@@ -496,9 +602,20 @@ public partial class MainWindow : Window
 
     private void SaveProgress()
     {
+        _progressSaveTimer?.Stop();
         Directory.CreateDirectory(Path.GetDirectoryName(_progressPath)!);
         File.WriteAllText(_progressPath, JsonSerializer.Serialize(_progress));
     }
+
+    private void ScheduleProgressSave()
+    {
+        if (_progressSaveTimer is { IsEnabled: false })
+        {
+            _progressSaveTimer.Start();
+        }
+    }
+
+    public void FlushProgress() => SaveProgress();
 
     private void RefreshProgress()
     {
@@ -551,22 +668,25 @@ public partial class MainWindow : Window
                 Height = 4,
                 Margin = new Thickness(1),
                 CornerRadius = new CornerRadius(1.5),
-                Background = isFuture ? Brushes.Transparent : ActivityBrush(seconds),
                 ToolTip = isFuture ? null : $"{date:yyyy-MM-dd} · {CompanionDurationFormatter.Format(seconds)}",
             };
+            if (!isFuture)
+            {
+                cell.SetResourceReference(Border.BackgroundProperty, ActivityBrushKey(seconds));
+            }
             Grid.SetColumn(cell, index / 7);
             Grid.SetRow(cell, (int)date.DayOfWeek);
             CompanionActivityGrid.Children.Add(cell);
         }
     }
 
-    private Brush ActivityBrush(long seconds) => seconds switch
+    private static string ActivityBrushKey(long seconds) => seconds switch
     {
-        <= 0 => (Brush)Resources["SurfaceMuted"],
-        < 900 => Brush(_theme == AppTheme.Light ? "#D8E8FF" : "#1E3C5A"),
-        < 3600 => Brush(_theme == AppTheme.Light ? "#8FC0FF" : "#2B6FAF"),
-        < 10800 => Brush(_theme == AppTheme.Light ? "#3D92F5" : "#0A84FF"),
-        _ => (Brush)Resources["Primary"],
+        <= 0 => "ActivityZero",
+        < 900 => "ActivityLow",
+        < 3600 => "ActivityMedium",
+        < 10800 => "ActivityHigh",
+        _ => "ActivityPeak",
     };
 
     private void RefreshContentLists()
@@ -576,8 +696,11 @@ public partial class MainWindow : Window
             .ToArray();
         NotesList.ItemsSource = entries;
         NotesList.SelectedItem = entries.FirstOrDefault(entry => entry.Id == _selectedNoteId);
-        QuotesList.ItemsSource = DefaultQuotes.Concat(_progress.CustomQuotes ?? []).ToArray();
-        WellnessPromptsList.ItemsSource = WellnessBuiltIns().Concat(_progress.WellnessCustomPrompts ?? []).ToArray();
+        PhraseLibraryPetLabel.Text = $"当前宠物：{_activePetName}";
+        QuotesList.ItemsSource = QuoteBuiltIns().Select(quote => new QuoteListEntry(quote, true))
+            .Concat((CurrentPhraseLibrary.CustomQuotes ?? []).Select(quote => new QuoteListEntry(quote, false)))
+            .ToArray();
+        WellnessPromptsList.ItemsSource = WellnessBuiltIns().Concat(CurrentPhraseLibrary.WellnessCustomPrompts ?? []).ToArray();
         WellnessEnabledInput.IsChecked = _progress.WellnessEnabled;
         WellnessInitialMinutesInput.Text = _progress.WellnessInitialMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture);
         WellnessRepeatMinutesInput.Text = _progress.WellnessRepeatMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -622,7 +745,7 @@ public partial class MainWindow : Window
             Points = _progress.Points + checked((int)gained),
             DailyUsageSeconds = dailyUsage,
         };
-        SaveProgress();
+        ScheduleProgressSave();
         if (gained > 0 || (after / 60) != (before / 60)) RefreshProgress();
     }
 
@@ -636,7 +759,7 @@ public partial class MainWindow : Window
 
     public void ShowRandomQuote()
     {
-        var quotes = DefaultQuotes.Concat(_progress.CustomQuotes ?? []).ToArray();
+        var quotes = QuoteBuiltIns().Concat(CurrentPhraseLibrary.CustomQuotes ?? []).ToArray();
         if (quotes.Length == 0) return;
         var quote = quotes[Random.Shared.Next(quotes.Length)];
         QuoteDisplay.Text = quote;
@@ -668,7 +791,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var prompts = WellnessBuiltIns().Concat(_progress.WellnessCustomPrompts ?? []).ToArray();
+        var prompts = WellnessBuiltIns().Concat(CurrentPhraseLibrary.WellnessCustomPrompts ?? []).ToArray();
         var prompt = prompts[Random.Shared.Next(prompts.Length)];
         _notify("健康提醒", prompt);
         _showPetMessage(prompt, PetAction.Waving);
@@ -712,9 +835,33 @@ public partial class MainWindow : Window
     private static PetAction NormalizeReminderAction(PetAction action) =>
         action is PetAction.Jumping or PetAction.Waving ? action : PetAction.Jumping;
 
-    private string[] WellnessBuiltIns() => _progress.WellnessBuiltInPrompts is { Length: > 0 } values && values.Length == DefaultWellnessPrompts.Length
+    private PetPhraseLibrary CurrentPhraseLibrary => _progress.PetPhraseLibraries is { } profiles &&
+        profiles.TryGetValue(_activePetId, out var library)
+        ? library
+        : PetPhraseLibrary.Empty;
+
+    private void UpdateCurrentPhraseLibrary(Func<PetPhraseLibrary, PetPhraseLibrary> update)
+    {
+        var profiles = PetPhraseLibraries.EnsureProfile(
+            _progress.PetPhraseLibraries,
+            _activePetId,
+            new PetPhraseLibrary(_progress.CustomQuotes, _progress.WellnessBuiltInPrompts, _progress.WellnessCustomPrompts));
+        profiles[_activePetId] = update(CurrentPhraseLibrary);
+        _progress = _progress with { PetPhraseLibraries = profiles };
+    }
+
+    private static bool DictionaryEqual(
+        Dictionary<string, PetPhraseLibrary>? left,
+        Dictionary<string, PetPhraseLibrary> right) =>
+        left is not null && left.Count == right.Count && left.All(pair => right.TryGetValue(pair.Key, out var value) && Equals(pair.Value, value));
+
+    private string[] WellnessBuiltIns() => CurrentPhraseLibrary.WellnessBuiltInPrompts is { Length: > 0 } values && values.Length == DefaultWellnessPrompts.Length
         ? [.. values]
         : [.. DefaultWellnessPrompts];
+
+    private string[] QuoteBuiltIns() => CurrentPhraseLibrary.BuiltInQuotes is { } values
+        ? [.. values]
+        : [.. DefaultQuotes];
 
     private void WellnessPromptSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
@@ -723,6 +870,8 @@ public partial class MainWindow : Window
 
     private sealed record NoteItem(Guid Id, string Text, bool Completed, DateTimeOffset CreatedAt, DateTime? DueAt = null, bool Notified = false, string Repeat = "single");
     private sealed record NoteListEntry(Guid Id, string Display) { public override string ToString() => Display; }
+    private sealed record QuoteListEntry(string Text, bool IsPreset) { public override string ToString() => Text; }
+    private sealed record PetSelection(string Id, string DisplayName) { public override string ToString() => DisplayName; }
     private sealed record ProgressState(
         int Points,
         int QuoteMinutes = 60,
@@ -739,7 +888,8 @@ public partial class MainWindow : Window
         string[]? WellnessCustomPrompts = null,
         DateTimeOffset? WellnessSessionStartedAt = null,
         DateTimeOffset? WellnessLastPromptAt = null,
-        bool WellnessOnBreak = false);
+        bool WellnessOnBreak = false,
+        Dictionary<string, PetPhraseLibrary>? PetPhraseLibraries = null);
 
     protected override void OnClosing(CancelEventArgs e)
     {

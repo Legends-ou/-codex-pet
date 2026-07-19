@@ -97,6 +97,10 @@ public sealed class DecodedFrame
 
     public byte[] CopyPixelBytes() => (byte[])_pixels.Clone();
 
+    // Rendering is synchronous and never mutates the source frame. Keeping this
+    // internal avoids a full-sized clone for every animation upload.
+    internal byte[] PixelBytes => _pixels;
+
     internal static DecodedFrame Standard(
         PetAction action,
         int frameIndex,

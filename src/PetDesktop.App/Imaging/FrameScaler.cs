@@ -17,7 +17,7 @@ public static class FrameScaler
 
         if (sourceWidth == targetWidth && sourceHeight == targetHeight)
         {
-            return (byte[])source.Clone();
+            return source;
         }
 
         var target = new byte[checked(targetWidth * targetHeight * 4)];

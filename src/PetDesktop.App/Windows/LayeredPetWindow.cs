@@ -11,10 +11,14 @@ public sealed class LayeredPetWindow : IDisposable
 {
     private readonly HwndSource _source;
     private readonly PetInputController _input = new(new(4, 4));
+    private readonly Dictionary<AlphaHitTestMask, IReadOnlyList<Int32Rect>> _maskRegionCache = [];
     private bool _disposed;
     private bool _hasCapture;
     private int _dragOffsetX;
     private int _dragOffsetY;
+    private CancellationTokenSource? _dragMoveCancellation;
+    private Task? _dragMoveTask;
+    private bool _dragTimerResolutionEnabled;
     private PetPointerPoint? _lastReportedPosition;
     private bool _isVisible;
 
@@ -99,7 +103,9 @@ public sealed class LayeredPetWindow : IDisposable
         int width,
         int height,
         byte[] premultipliedBgra,
-        bool revealWindow = true)
+        bool revealWindow = true,
+        AlphaHitTestMask? knownMask = null,
+        bool preserveCurrentPosition = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _source.Dispatcher.VerifyAccess();
@@ -117,9 +123,24 @@ public sealed class LayeredPetWindow : IDisposable
                 nameof(premultipliedBgra));
         }
 
-        var alpha = ExtractAndValidateAlpha(premultipliedBgra, checked((int)pixelCount));
-        var mask = new AlphaHitTestMask(width, height, alpha);
-        var runs = MaskRegionBuilder.BuildRuns(mask);
+        var canReuseMask = knownMask is { Width: var maskWidth, Height: var maskHeight }
+            && maskWidth == width
+            && maskHeight == height;
+        var mask = canReuseMask
+            ? knownMask!
+            : new AlphaHitTestMask(width, height, ExtractAndValidateAlpha(premultipliedBgra, checked((int)pixelCount)));
+        var runs = canReuseMask ? GetRegionRuns(mask) : MaskRegionBuilder.BuildRuns(mask);
+
+        // Native dragging updates the HWND directly for cursor-level responsiveness.
+        // When a new animation frame is committed during that drag, use the HWND's
+        // actual position so UpdateLayeredWindow never snaps it back to a stale
+        // application-side position.
+        if (preserveCurrentPosition
+            && NativeMethods.GetWindowRect(Handle, out var currentWindowRect))
+        {
+            screenX = currentWindowRect.Left;
+            screenY = currentWindowRect.Top;
+        }
 
         var uploadResult = UpdateLayeredBitmap(screenX, screenY, width, height, premultipliedBgra);
 
@@ -134,6 +155,18 @@ public sealed class LayeredPetWindow : IDisposable
         }
 
         ReportPositionIfChanged(new PetPointerPoint(screenX, screenY));
+    }
+
+    private IReadOnlyList<Int32Rect> GetRegionRuns(AlphaHitTestMask mask)
+    {
+        if (_maskRegionCache.TryGetValue(mask, out var runs))
+        {
+            return runs;
+        }
+
+        runs = MaskRegionBuilder.BuildRuns(mask);
+        _maskRegionCache.Add(mask, runs);
+        return runs;
     }
 
     public void RevealPreparedFrame()
@@ -160,6 +193,7 @@ public sealed class LayeredPetWindow : IDisposable
         ReleaseDragCapture();
         _source.RemoveHook(WindowProcedure);
         _source.Dispose();
+        _maskRegionCache.Clear();
         _disposed = true;
     }
 
@@ -513,6 +547,7 @@ public sealed class LayeredPetWindow : IDisposable
                 break;
 
             case NativeMethods.WmCaptureChanged:
+                StopDragMoveLoop();
                 _hasCapture = false;
                 break;
 
@@ -560,6 +595,22 @@ public sealed class LayeredPetWindow : IDisposable
             return;
         }
 
+        var wasDragging = _hasCapture;
+        StopDragMoveLoop();
+        if (wasDragging)
+        {
+            MoveWindowToCursor(Handle, _dragOffsetX, _dragOffsetY);
+        }
+
+        // During a drag, movement remains entirely on this native HWND path.
+        // Publish its final position once before the managed completion handler
+        // runs, so saving, bubbles, and the next animation frame all use the
+        // exact dropped location without adding work to every mouse message.
+        if (NativeMethods.GetWindowRect(Handle, out var windowRect))
+        {
+            ReportPositionIfChanged(new PetPointerPoint(windowRect.Left, windowRect.Top));
+        }
+
         PublishInput(_input.PointerUp(new PetPointerPoint(cursor.X, cursor.Y)));
     }
 
@@ -584,6 +635,10 @@ public sealed class LayeredPetWindow : IDisposable
 
         _ = NativeMethods.SetCapture(window);
         _hasCapture = NativeMethods.GetCapture() == window;
+        if (_hasCapture)
+        {
+            StartDragMoveLoop(window, _dragOffsetX, _dragOffsetY);
+        }
     }
 
     private void ContinueDrag(nint window)
@@ -594,6 +649,62 @@ public sealed class LayeredPetWindow : IDisposable
             return;
         }
 
+        // The dedicated native move loop samples the cursor independently of
+        // WPF's coalesced WM_MOUSEMOVE delivery. Keep this handler lightweight
+        // so it can continue to provide interaction and animation state.
+    }
+
+    private void StartDragMoveLoop(nint window, int offsetX, int offsetY)
+    {
+        StopDragMoveLoop();
+        _dragTimerResolutionEnabled = NativeMethods.timeBeginPeriod(1) == 0;
+        var cancellation = new CancellationTokenSource();
+        _dragMoveCancellation = cancellation;
+        _dragMoveTask = Task.Run(() =>
+        {
+            while (!cancellation.IsCancellationRequested)
+            {
+                MoveWindowToCursor(window, offsetX, offsetY);
+                cancellation.Token.WaitHandle.WaitOne(1);
+            }
+        });
+    }
+
+    private void StopDragMoveLoop()
+    {
+        var cancellation = _dragMoveCancellation;
+        var task = _dragMoveTask;
+        _dragMoveCancellation = null;
+        _dragMoveTask = null;
+        cancellation?.Cancel();
+
+        if (_dragTimerResolutionEnabled)
+        {
+            _ = NativeMethods.timeEndPeriod(1);
+            _dragTimerResolutionEnabled = false;
+        }
+
+        if (task is null)
+        {
+            cancellation?.Dispose();
+            return;
+        }
+
+        if (task.Wait(20))
+        {
+            cancellation?.Dispose();
+            return;
+        }
+
+        _ = task.ContinueWith(
+            _ => cancellation?.Dispose(),
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            TaskScheduler.Default);
+    }
+
+    private static void MoveWindowToCursor(nint window, int offsetX, int offsetY)
+    {
         if (!NativeMethods.GetCursorPos(out var cursor))
         {
             return;
@@ -602,14 +713,13 @@ public sealed class LayeredPetWindow : IDisposable
         _ = NativeMethods.SetWindowPos(
             window,
             nint.Zero,
-            cursor.X - _dragOffsetX,
-            cursor.Y - _dragOffsetY,
+            cursor.X - offsetX,
+            cursor.Y - offsetY,
             0,
             0,
             NativeMethods.SwpNoSize
                 | NativeMethods.SwpNoZOrder
                 | NativeMethods.SwpNoActivate);
-        ReportPositionIfChanged(new PetPointerPoint(cursor.X - _dragOffsetX, cursor.Y - _dragOffsetY));
     }
 
     private void ReportPositionIfChanged(PetPointerPoint position)
@@ -631,6 +741,7 @@ public sealed class LayeredPetWindow : IDisposable
 
     private void ReleaseDragCapture()
     {
+        StopDragMoveLoop();
         if (!_hasCapture)
         {
             return;
