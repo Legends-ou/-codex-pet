@@ -5,6 +5,16 @@ namespace PetDesktop.App.Tests;
 public sealed class FrameScalerTests
 {
     [Fact]
+    public void ScaleBgraReusesSourceWhenDimensionsMatch()
+    {
+        var source = new byte[] { 1, 2, 3, 4 };
+
+        var scaled = FrameScaler.ScaleBgra(source, 1, 1, 1, 1);
+
+        Assert.Same(source, scaled);
+    }
+
+    [Fact]
     public void ScaleBgraUsesNearestPixelsAndPreservesFourChannels()
     {
         var source = new byte[]
