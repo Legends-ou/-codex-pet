@@ -24,10 +24,13 @@ try {
             throw "Portable archive is missing $entryName"
         }
     }
-    $manifestEntries = @($archive.Entries | Where-Object { $_.FullName -like 'pets\*\pet.json' })
-    $spritesheetEntries = @($archive.Entries | Where-Object { $_.FullName -like 'pets\*\spritesheet.webp' })
-    if ($manifestEntries.Count -eq 0 -or $spritesheetEntries.Count -eq 0) {
-        throw 'Portable archive is missing a complete default pet package.'
+    $petDirectoryEntries = @($archive.Entries | Where-Object { $_.FullName -match '^(?i:pets[/\\])$' })
+    if ($petDirectoryEntries.Count -eq 0) {
+        throw 'Portable archive is missing the empty pets folder.'
+    }
+    $petFileEntries = @($archive.Entries | Where-Object { $_.FullName -match '^(?i:pets[/\\]).+' })
+    if ($petFileEntries.Count -ne 0) {
+        throw 'Portable archive contains pet resources. Pets must be user-supplied.'
     }
 }
 finally {

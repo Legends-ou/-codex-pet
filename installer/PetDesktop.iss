@@ -18,6 +18,9 @@ SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#MyAppName}
 
+[Dirs]
+Name: "{app}\pets"
+
 [Files]
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 

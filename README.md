@@ -19,7 +19,7 @@ Codex v1 and v2 package conventions, including PNG and WebP sprite sheets.
 | `src/PetDesktop.App` | WPF desktop application |
 | `src/PetDesktop.Core` | Pet parsing, animation, settings, reminders, progression, and wellness logic |
 | `tests/` | Unit and contract tests |
-| `assets/` | Application icon and bundled default pets |
+| `assets/` | Application icon |
 | `installer/` | Inno Setup installer definition |
 | `scripts/` | Release build and verification scripts |
 | `docs/` | Release process documentation |
@@ -55,9 +55,11 @@ file-size limit.
 
 ## Pet resources
 
-Bundled pets live under `assets/pets/`. At runtime, the application checks its own
-`pets/` folder, so a portable build can be customized by placing compatible pet folders
-beside the executable. See the existing `assets/pets/小宇/` package as a minimal example.
+Release packages include an empty `pets/` folder but no pet resources. Pet Desktop
+reads that folder on launch. Place each compatible Codex v1 or v2 pet
+folder inside it (the tray menu provides “open pets folder”). For a portable build,
+the folder sits beside the executable. Updating an existing installation or replacing
+portable program files does not remove that user-managed folder.
 
 ## License
 

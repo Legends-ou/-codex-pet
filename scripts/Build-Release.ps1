@@ -31,8 +31,25 @@ $publishDir = Join-Path $artifactsDir "publish-$Version"
 New-Item -ItemType Directory -Path $publishDir, $artifactsDir -Force | Out-Null
 & $dotnet publish (Join-Path $projectRoot 'src\PetDesktop.App\PetDesktop.App.csproj') -c Release -r win-x64 --self-contained true --no-restore -p:PublishSingleFile=true -p:Version=$Version -o $publishDir
 if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+$publishPetsDir = Join-Path $publishDir 'pets'
+$publishPetFiles = @(Get-ChildItem -LiteralPath $publishPetsDir -File -Recurse -ErrorAction SilentlyContinue)
+if ($publishPetFiles.Count -ne 0) {
+    throw 'Publish output contains pet files. Release packages must contain an empty pets folder only.'
+}
+New-Item -ItemType Directory -Path $publishPetsDir -Force | Out-Null
 New-Item -ItemType File -Path (Join-Path $publishDir '.portable') -Force | Out-Null
-Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath (Join-Path $artifactsDir "PetDesktop-Portable-$Version.zip") -Force
+ $portablePath = Join-Path $artifactsDir "PetDesktop-Portable-$Version.zip"
+Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $portablePath -Force
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$portableArchive = [System.IO.Compression.ZipFile]::Open($portablePath, [System.IO.Compression.ZipArchiveMode]::Update)
+try {
+    if ($null -eq $portableArchive.GetEntry('pets/')) {
+        $null = $portableArchive.CreateEntry('pets/')
+    }
+}
+finally {
+    $portableArchive.Dispose()
+}
 Remove-Item -LiteralPath (Join-Path $publishDir '.portable') -Force
 & $iscc "/DMyAppVersion=$Version" "/DPublishDir=$publishDir" (Join-Path $projectRoot 'installer\PetDesktop.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
