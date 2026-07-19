@@ -4,6 +4,7 @@ using System.Windows.Media.Effects;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
+using System.Windows.Interop;
 using PetDesktop.Core.Configuration;
 using MediaBrushes = System.Windows.Media.Brushes;
 using MediaColor = System.Windows.Media.Color;
@@ -14,12 +15,15 @@ internal sealed class PetSpeechBubble
 {
     private readonly Window _window;
     private readonly Border _surface;
-    private readonly Border _accent;
     private readonly Path _tail;
     private readonly TextBlock _text;
     private readonly StackPanel _content;
     private readonly DispatcherTimer _hideTimer;
     private bool _tailPointsDown = true;
+    private int _lastPetX = int.MinValue;
+    private int _lastPetY = int.MinValue;
+    private int _lastPetWidth;
+    private int _lastPetHeight;
 
     public PetSpeechBubble()
     {
@@ -32,15 +36,7 @@ internal sealed class PetSpeechBubble
             TextWrapping = TextWrapping.Wrap,
             MaxWidth = 280,
         };
-        _accent = new Border
-        {
-            Width = 24,
-            Height = 3,
-            CornerRadius = new CornerRadius(2),
-            Margin = new Thickness(0, 0, 0, 8),
-        };
         var body = new StackPanel();
-        body.Children.Add(_accent);
         body.Children.Add(_text);
         _surface = new Border
         {
@@ -87,7 +83,6 @@ internal sealed class PetSpeechBubble
         _surface.Background = background;
         _surface.BorderBrush = new SolidColorBrush(MediaColor.FromArgb(150, light ? (byte)218 : (byte)255, light ? (byte)218 : (byte)255, light ? (byte)218 : (byte)220));
         _tail.Fill = background;
-        _accent.Background = new SolidColorBrush(light ? MediaColor.FromRgb(0, 122, 255) : MediaColor.FromRgb(10, 132, 255));
         _text.Foreground = light
             ? new SolidColorBrush(MediaColor.FromRgb(36, 36, 38))
             : new SolidColorBrush(MediaColor.FromRgb(230, 230, 235));
@@ -96,8 +91,10 @@ internal sealed class PetSpeechBubble
     public void Show(string text, int x, int y, int petWidth, int petHeight)
     {
         _text.Text = text;
-        Place(x, y, petWidth, petHeight, measure: true);
         if (!_window.IsVisible) _window.Show();
+        _window.UpdateLayout();
+        ResetFollowPosition();
+        Place(x, y, petWidth, petHeight, force: true);
         _hideTimer.Stop();
         _hideTimer.Start();
     }
@@ -105,39 +102,89 @@ internal sealed class PetSpeechBubble
     public void Follow(int x, int y, int petWidth, int petHeight)
     {
         if (!_window.IsVisible) return;
-        Place(x, y, petWidth, petHeight, measure: false);
+        Place(x, y, petWidth, petHeight, force: false);
     }
 
-    private void Place(int x, int y, int petWidth, int petHeight, bool measure)
+    private void Place(int x, int y, int petWidth, int petHeight, bool force)
     {
+        if (!force
+            && x == _lastPetX
+            && y == _lastPetY
+            && petWidth == _lastPetWidth
+            && petHeight == _lastPetHeight)
+        {
+            return;
+        }
+
         var screen = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point(x + (petWidth / 2), y + (petHeight / 2)));
         var area = screen.WorkingArea;
         SetTailDirection(pointsDown: true);
-        if (measure) _window.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
-        var desired = measure ? _window.DesiredSize : new System.Windows.Size(_window.ActualWidth, _window.ActualHeight);
+        _window.UpdateLayout();
+        var desired = GetPhysicalSize();
         var petCenter = x + (petWidth / 2d);
         var left = Math.Clamp(petCenter - (desired.Width / 2d), area.Left + 8d, area.Right - desired.Width - 8d);
         var above = y - desired.Height - 12 >= area.Top + 8;
         if (!above)
         {
             SetTailDirection(pointsDown: false);
-            if (measure) _window.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
-            desired = measure ? _window.DesiredSize : new System.Windows.Size(_window.ActualWidth, _window.ActualHeight);
+            _window.UpdateLayout();
+            desired = GetPhysicalSize();
             left = Math.Clamp(petCenter - (desired.Width / 2d), area.Left + 8d, area.Right - desired.Width - 8d);
         }
 
         var tailInset = Math.Clamp(petCenter - left - 9d, 20d, Math.Max(20d, desired.Width - 27d));
         _tail.Margin = new Thickness(tailInset, -1, 0, 0);
-        _window.Left = left;
-        _window.Top = above
+        var top = above
             ? Math.Max(area.Top + 8, y - desired.Height - 12)
             : Math.Min(area.Bottom - desired.Height - 8, y + petHeight + 10);
+        MoveToPhysicalScreenPosition((int)Math.Round(left), (int)Math.Round(top));
+        _lastPetX = x;
+        _lastPetY = y;
+        _lastPetWidth = petWidth;
+        _lastPetHeight = petHeight;
     }
 
     public void Hide()
     {
         _hideTimer.Stop();
         _window.Hide();
+        ResetFollowPosition();
+    }
+
+    private System.Windows.Size GetPhysicalSize()
+    {
+        var handle = new WindowInteropHelper(_window).Handle;
+        if (!NativeMethods.GetWindowRect(handle, out var rectangle))
+        {
+            return new System.Windows.Size(
+                Math.Max(1d, _window.ActualWidth),
+                Math.Max(1d, _window.ActualHeight));
+        }
+
+        return new System.Windows.Size(
+            Math.Max(1, rectangle.Right - rectangle.Left),
+            Math.Max(1, rectangle.Bottom - rectangle.Top));
+    }
+
+    private void MoveToPhysicalScreenPosition(int left, int top)
+    {
+        var handle = new WindowInteropHelper(_window).Handle;
+        _ = NativeMethods.SetWindowPos(
+            handle,
+            NativeMethods.HwndTopmost,
+            left,
+            top,
+            0,
+            0,
+            NativeMethods.SwpNoSize | NativeMethods.SwpNoActivate);
+    }
+
+    private void ResetFollowPosition()
+    {
+        _lastPetX = int.MinValue;
+        _lastPetY = int.MinValue;
+        _lastPetWidth = 0;
+        _lastPetHeight = 0;
     }
 
     private void SetTailDirection(bool pointsDown)

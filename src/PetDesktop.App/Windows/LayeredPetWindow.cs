@@ -15,6 +15,8 @@ public sealed class LayeredPetWindow : IDisposable
     private bool _hasCapture;
     private int _dragOffsetX;
     private int _dragOffsetY;
+    private PetPointerPoint? _lastReportedPosition;
+    private bool _isVisible;
 
     public LayeredPetWindow(int initialWidth, int initialHeight)
     {
@@ -40,8 +42,11 @@ public sealed class LayeredPetWindow : IDisposable
                     | NativeMethods.WsExTopmost
                     | NativeMethods.WsExNoActivate,
                 UsesPerPixelOpacity = true,
-                PositionX = 0,
-                PositionY = 0,
+                // Keep the native HWND off-screen until the first complete
+                // layered frame has been committed. This prevents a transient
+                // top-left flash on slower compositors during startup.
+                PositionX = -32000,
+                PositionY = -32000,
             };
 
             _source = new HwndSource(parameters);
@@ -93,7 +98,8 @@ public sealed class LayeredPetWindow : IDisposable
         int screenY,
         int width,
         int height,
-        byte[] premultipliedBgra)
+        byte[] premultipliedBgra,
+        bool revealWindow = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _source.Dispatcher.VerifyAccess();
@@ -120,10 +126,27 @@ public sealed class LayeredPetWindow : IDisposable
         LayeredFrameCommitCoordinator.CompleteAfterSuccessfulUpload(
             uploadResult,
             () => ApplyWindowRegion(runs),
-            () => _ = NativeMethods.ShowWindow(Handle, NativeMethods.SwHide));
+            HideAfterFailedFrame);
+
+        if (revealWindow)
+        {
+            RevealPreparedFrame();
+        }
+
+        ReportPositionIfChanged(new PetPointerPoint(screenX, screenY));
+    }
+
+    public void RevealPreparedFrame()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _source.Dispatcher.VerifyAccess();
+        if (_isVisible)
+        {
+            return;
+        }
 
         _ = NativeMethods.ShowWindow(Handle, NativeMethods.SwShowNoActivate);
-        PositionChanged?.Invoke(new PetPointerPoint(screenX, screenY));
+        _isVisible = true;
     }
 
     public void Dispose()
@@ -586,7 +609,24 @@ public sealed class LayeredPetWindow : IDisposable
             NativeMethods.SwpNoSize
                 | NativeMethods.SwpNoZOrder
                 | NativeMethods.SwpNoActivate);
-        PositionChanged?.Invoke(new PetPointerPoint(cursor.X - _dragOffsetX, cursor.Y - _dragOffsetY));
+        ReportPositionIfChanged(new PetPointerPoint(cursor.X - _dragOffsetX, cursor.Y - _dragOffsetY));
+    }
+
+    private void ReportPositionIfChanged(PetPointerPoint position)
+    {
+        if (_lastReportedPosition == position)
+        {
+            return;
+        }
+
+        _lastReportedPosition = position;
+        PositionChanged?.Invoke(position);
+    }
+
+    private void HideAfterFailedFrame()
+    {
+        _ = NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
+        _isVisible = false;
     }
 
     private void ReleaseDragCapture()

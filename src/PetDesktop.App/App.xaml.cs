@@ -39,6 +39,13 @@ public partial class App : System.Windows.Application, IDisposable
     private PetPointerPoint? _lastKnownPosition;
     private int _displayWidth;
     private int _displayHeight;
+    private DecodedFrame? _lastRenderedFrame;
+    private int _lastRenderedWidth;
+    private int _lastRenderedHeight;
+    private int _initialRenderRetryCount;
+    private int _dragDirection;
+    private bool _isDragging;
+    private PetPointerPoint? _pendingBubblePosition;
     private double _currentScalePercent = 100;
     private double _targetScalePercent = 100;
     private IReadOnlyList<PetDescriptor> _pets = [];
@@ -144,6 +151,7 @@ public partial class App : System.Windows.Application, IDisposable
             }
 
             _asset = candidate;
+            _lastRenderedFrame = null;
             _animation = new AnimationStateMachine(layout);
             var frame = candidate.ActionFrames[PetAction.Idle][0];
             GetDisplaySize(frame.Width, frame.Height, _currentScalePercent, out _displayWidth, out _displayHeight);
@@ -151,12 +159,13 @@ public partial class App : System.Windows.Application, IDisposable
                 ? new PetPlacement(knownPosition.X, knownPosition.Y)
                 : _placementResolver.Resolve(_settings.Placement, GetDisplays(), _displayWidth, _displayHeight);
             _lastKnownPosition = new PetPointerPoint(placement.X, placement.Y);
-            _prototypeWindow.UpdateFrame(
-                placement.X,
-                placement.Y,
-                _displayWidth,
-                _displayHeight,
-                FrameScaler.ScaleBgra(frame.CopyPixelBytes(), frame.Width, frame.Height, _displayWidth, _displayHeight));
+            var initialPosition = new PetPointerPoint(placement.X, placement.Y);
+            _animation.SetLookSector(GetLookSector(initialPosition));
+            frame = _animation.CurrentAction is { } initialAction
+                ? candidate.ActionFrames[initialAction][_animation.CurrentFrameIndex]
+                : candidate.LookFrames[_animation.CurrentLookSector ?? 0];
+            RenderFrame(frame, initialPosition, force: true, revealWindow: false);
+            _initialRenderRetryCount = 0;
             // A selection becomes persistent only after its atlas has decoded and displayed successfully.
             // This preserves the currently working pet if an external package is incomplete or corrupt.
             if (!string.Equals(_settings.SelectedPetId, pet.Id, StringComparison.Ordinal))
@@ -164,19 +173,25 @@ public partial class App : System.Windows.Application, IDisposable
                 _settings = _settings with { SelectedPetId = pet.Id };
                 _ = SaveSettingsAsync();
             }
-            _lastAnimationTimestamp = Stopwatch.GetTimestamp();
-            _animationTimer ??= new DispatcherTimer(DispatcherPriority.Render)
+            _ = Dispatcher.InvokeAsync(() =>
             {
-                Interval = TimeSpan.FromMilliseconds(16),
-            };
-            _animationTimer.Tick -= OnAnimationTick;
-            _animationTimer.Tick += OnAnimationTick;
-            _animationTimer.Start();
+                _prototypeWindow?.RevealPreparedFrame();
+                StartAnimationTimer();
+            }, DispatcherPriority.Render);
         }
         catch (Exception exception)
         {
             // Keep the currently displayed, fully decoded asset during an incomplete or corrupt update.
             LocalDiagnostics.Write(exception);
+            if (_prototypeWindow is not null
+                && _asset is not null
+                && _initialRenderRetryCount < 3)
+            {
+                _initialRenderRetryCount++;
+                _ = RetryInitialRenderAsync(requestedPetId, TimeSpan.FromMilliseconds(250 * _initialRenderRetryCount));
+                return;
+            }
+
             _tray?.ShowStatus("Pet Desktop", "The pet could not be displayed. Open the local diagnostic log for details.");
             _animation?.SetResourcePhase(ResourceAnimationPhase.Failed);
         }
@@ -184,6 +199,12 @@ public partial class App : System.Windows.Application, IDisposable
         {
             _reloadGate.Release();
         }
+    }
+
+    private async Task RetryInitialRenderAsync(string? requestedPetId, TimeSpan delay)
+    {
+        await Task.Delay(delay);
+        await Dispatcher.InvokeAsync(() => _ = ReloadPetAsync(requestedPetId));
     }
 
     protected override void OnExit(ExitEventArgs e)
@@ -229,20 +250,8 @@ public partial class App : System.Windows.Application, IDisposable
         }
 
         var now = Stopwatch.GetTimestamp();
-        var currentPosition = _prototypeWindow.Position;
-        var cursor = System.Windows.Forms.Cursor.Position;
-        var petScreen = Screen.FromPoint(new System.Drawing.Point(
-            currentPosition.X + (_displayWidth / 2),
-            currentPosition.Y + (_displayHeight / 2)));
-        var cursorScreen = Screen.FromPoint(cursor);
-        var lookSector = string.Equals(petScreen.DeviceName, cursorScreen.DeviceName, StringComparison.OrdinalIgnoreCase)
-            ? LookDirectionQuantizer.Quantize(
-                cursor.X - (currentPosition.X + (_displayWidth / 2d)),
-                cursor.Y - (currentPosition.Y + (_displayHeight / 2d)),
-                deadZone: 24,
-                maxRadius: 480)
-            : null;
-        _animation.SetLookSector(lookSector);
+        var currentPosition = _lastKnownPosition ?? _prototypeWindow.Position;
+        _animation.SetLookSector(GetLookSector(currentPosition));
         var elapsed = Stopwatch.GetElapsedTime(_lastAnimationTimestamp, now);
         _animation.Tick(elapsed);
         _lastAnimationTimestamp = now;
@@ -256,16 +265,77 @@ public partial class App : System.Windows.Application, IDisposable
             return;
         }
 
-        GetDisplaySize(frame.Width, frame.Height, _currentScalePercent, out _displayWidth, out _displayHeight);
-
         _lastKnownPosition = currentPosition;
-        var position = _lastKnownPosition.Value;
-        _prototypeWindow.UpdateFrame(
+        RenderFrame(frame, currentPosition, force: false);
+        FlushPendingBubblePosition();
+    }
+
+    private int? GetLookSector(PetPointerPoint position)
+    {
+        var cursor = System.Windows.Forms.Cursor.Position;
+        var petScreen = Screen.FromPoint(new System.Drawing.Point(
+            position.X + (_displayWidth / 2),
+            position.Y + (_displayHeight / 2)));
+        var cursorScreen = Screen.FromPoint(cursor);
+        return string.Equals(petScreen.DeviceName, cursorScreen.DeviceName, StringComparison.OrdinalIgnoreCase)
+            ? LookDirectionQuantizer.Quantize(
+                cursor.X - (position.X + (_displayWidth / 2d)),
+                cursor.Y - (position.Y + (_displayHeight / 2d)),
+                deadZone: 24,
+                maxRadius: 480)
+            : null;
+    }
+
+    private void RenderCurrentFrame(bool force)
+    {
+        if (_prototypeWindow is null || _asset is null || _animation is null)
+        {
+            return;
+        }
+
+        var frame = _animation.CurrentAction is { } action
+            ? _asset.ActionFrames[action][_animation.CurrentFrameIndex]
+            : _asset.LookFrames[_animation.CurrentLookSector ?? 0];
+        var position = _lastKnownPosition ?? _prototypeWindow.Position;
+        _lastKnownPosition = position;
+        RenderFrame(frame, position, force);
+    }
+
+    private void RenderFrame(DecodedFrame frame, PetPointerPoint position, bool force, bool revealWindow = true)
+    {
+        GetDisplaySize(frame.Width, frame.Height, _currentScalePercent, out var width, out var height);
+        if (!force
+            && ReferenceEquals(frame, _lastRenderedFrame)
+            && width == _lastRenderedWidth
+            && height == _lastRenderedHeight)
+        {
+            return;
+        }
+
+        _prototypeWindow!.UpdateFrame(
             position.X,
             position.Y,
-            _displayWidth,
-            _displayHeight,
-            FrameScaler.ScaleBgra(frame.CopyPixelBytes(), frame.Width, frame.Height, _displayWidth, _displayHeight));
+            width,
+            height,
+            FrameScaler.ScaleBgra(frame.CopyPixelBytes(), frame.Width, frame.Height, width, height),
+            revealWindow);
+        _displayWidth = width;
+        _displayHeight = height;
+        _lastRenderedFrame = frame;
+        _lastRenderedWidth = width;
+        _lastRenderedHeight = height;
+    }
+
+    private void StartAnimationTimer()
+    {
+        _lastAnimationTimestamp = Stopwatch.GetTimestamp();
+        _animationTimer ??= new DispatcherTimer(DispatcherPriority.Render)
+        {
+            Interval = TimeSpan.FromMilliseconds(16),
+        };
+        _animationTimer.Tick -= OnAnimationTick;
+        _animationTimer.Tick += OnAnimationTick;
+        _animationTimer.Start();
     }
 
     private void OnWindowInput(PetInputResult result)
@@ -289,14 +359,35 @@ public partial class App : System.Windows.Application, IDisposable
             }
         }
 
+        if (result.StartDrag)
+        {
+            _isDragging = true;
+            _animationTimer?.Interval = TimeSpan.FromMilliseconds(10);
+        }
+
         if ((result.StartDrag || result.MoveDrag) && result.HorizontalDelta != 0)
         {
-            _animation.SetDragging(result.HorizontalDelta);
+            var direction = Math.Sign(result.HorizontalDelta);
+            if (_dragDirection != direction)
+            {
+                _dragDirection = direction;
+                _animation.SetDragging(result.HorizontalDelta);
+                RenderCurrentFrame(force: true);
+            }
         }
 
         if (result.CompletedDrag)
         {
+            _isDragging = false;
+            _dragDirection = 0;
             _animation.SetDragging(0);
+            if (_animationTimer is not null)
+            {
+                _animationTimer.Interval = TimeSpan.FromMilliseconds(16);
+            }
+
+            RenderCurrentFrame(force: true);
+            FlushPendingBubblePosition();
             SaveCurrentPlacement();
         }
     }
@@ -463,8 +554,28 @@ public partial class App : System.Windows.Application, IDisposable
         _speechBubble.Show(message, position.X, position.Y, _displayWidth, _displayHeight);
     }
 
-    private void OnPetPositionChanged(PetPointerPoint position) =>
+    private void OnPetPositionChanged(PetPointerPoint position)
+    {
+        _lastKnownPosition = position;
+        if (_isDragging)
+        {
+            _pendingBubblePosition = position;
+            return;
+        }
+
         _speechBubble?.Follow(position.X, position.Y, _displayWidth, _displayHeight);
+    }
+
+    private void FlushPendingBubblePosition()
+    {
+        if (_pendingBubblePosition is not { } position)
+        {
+            return;
+        }
+
+        _pendingBubblePosition = null;
+        _speechBubble?.Follow(position.X, position.Y, _displayWidth, _displayHeight);
+    }
 
     private void SetStartWithWindows(bool enabled)
     {
